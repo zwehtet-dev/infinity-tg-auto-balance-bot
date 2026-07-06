@@ -11,7 +11,6 @@ import logging
 import base64
 import sqlite3
 import psycopg
-from psycopg.rows import dict_row
 import asyncio
 import traceback
 from telegram import Update
@@ -47,7 +46,8 @@ def get_db_connection():
     """Return a database connection (PostgreSQL or SQLite based on env)"""
     db_url = os.getenv('DATABASE_URL')
     if db_url and db_url.startswith('postgres'):
-        conn = psycopg.connect(db_url, row_factory=dict_row)
+        # Keep PostgreSQL rows tuple-shaped so they match the SQLite code path.
+        conn = psycopg.connect(db_url)
         return conn
     else:
         db_file = os.getenv('SQLITE_DB_FILE', 'bot_data.db')
