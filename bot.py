@@ -6310,6 +6310,13 @@ def main():
     """Start bot"""
     # Initialize database
     init_database()
+
+    # Python 3.14 no longer creates a default event loop for the main thread.
+    # python-telegram-bot still expects one to exist before run_polling().
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     
     # Build application with increased connection pool settings and timeouts
     # Increased timeouts to handle slow network connections
