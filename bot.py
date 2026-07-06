@@ -72,11 +72,16 @@ def init_database():
     else:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_prefixes (
-                user_id SERIAL PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 prefix_name TEXT NOT NULL,
                 username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        ''')
+        cursor.execute('''
+            ALTER TABLE user_prefixes
+            ALTER COLUMN user_id TYPE BIGINT,
+            ALTER COLUMN user_id DROP DEFAULT
         ''')
     
     # Settings table for receiving USDT account

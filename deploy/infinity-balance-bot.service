@@ -1,0 +1,15 @@
+[Unit]
+Description=Infinity Telegram Auto Balance Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/infinity-tg-auto-balance-bot
+ExecStart=/opt/infinity-tg-auto-balance-bot/.venv/bin/python /opt/infinity-tg-auto-balance-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
