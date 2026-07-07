@@ -15,7 +15,7 @@ import asyncio
 import traceback
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 # Load environment
@@ -29,18 +29,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
+def _env_int(name, default=0):
+    """Read an integer env var, tolerating empty/invalid values"""
+    value = os.getenv(name, '')
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-TARGET_GROUP_ID = int(os.getenv('TARGET_GROUP_ID', '0'))
-USDT_TRANSFERS_TOPIC_ID = int(os.getenv('USDT_TRANSFERS_TOPIC_ID', '0'))
-AUTO_BALANCE_TOPIC_ID = int(os.getenv('AUTO_BALANCE_TOPIC_ID', '0'))
-ACCOUNTS_MATTER_TOPIC_ID = int(os.getenv('ACCOUNTS_MATTER_TOPIC_ID', '0'))
-ALERT_TOPIC_ID = int(os.getenv('ALERT_TOPIC_ID', '0'))
+TARGET_GROUP_ID = _env_int('TARGET_GROUP_ID')
+USDT_TRANSFERS_TOPIC_ID = _env_int('USDT_TRANSFERS_TOPIC_ID')
+AUTO_BALANCE_TOPIC_ID = _env_int('AUTO_BALANCE_TOPIC_ID')
+ACCOUNTS_MATTER_TOPIC_ID = _env_int('ACCOUNTS_MATTER_TOPIC_ID')
+ALERT_TOPIC_ID = _env_int('ALERT_TOPIC_ID')
 
 if not TELEGRAM_BOT_TOKEN or not OPENAI_API_KEY:
     raise ValueError("Missing required environment variables")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Async client so OCR calls don't block the event loop (media-group timers,
+# polling and other handlers keep running while a receipt is being read)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 def get_db_connection():
     """Return a database connection (PostgreSQL or SQLite based on env)"""
@@ -292,16 +302,16 @@ def save_media_group_photo(media_group_id: str, message_id: int, photo_bytes: by
     # Save to database
     conn = get_db_connection()
     cursor = conn.cursor()
-    try:
+    if isinstance(conn, sqlite3.Connection):
+        cursor.execute('''
+            INSERT OR REPLACE INTO media_group_photos (media_group_id, message_id, file_path)
+            VALUES (?, ?, ?)
+        ''', (media_group_id, message_id, file_path))
+    else:
         cursor.execute('''
             INSERT INTO media_group_photos (media_group_id, message_id, file_path)
             VALUES (%s, %s, %s)
             ON CONFLICT (media_group_id, message_id) DO UPDATE SET file_path = EXCLUDED.file_path
-        ''', (media_group_id, message_id, file_path))
-    except Exception:
-        cursor.execute('''
-            INSERT OR REPLACE INTO media_group_photos (media_group_id, message_id, file_path)
-            VALUES (?, ?, ?)
         ''', (media_group_id, message_id, file_path))
     conn.commit()
     conn.close()
@@ -313,16 +323,16 @@ def get_media_group_photos(media_group_id: str) -> list:
     """Get all photo paths for a media group from database"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            SELECT message_id, file_path FROM media_group_photos
-            WHERE media_group_id = %s
-            ORDER BY message_id
-        ''', (media_group_id,))
-    except Exception:
+    if isinstance(conn, sqlite3.Connection):
         cursor.execute('''
             SELECT message_id, file_path FROM media_group_photos
             WHERE media_group_id = ?
+            ORDER BY message_id
+        ''', (media_group_id,))
+    else:
+        cursor.execute('''
+            SELECT message_id, file_path FROM media_group_photos
+            WHERE media_group_id = %s
             ORDER BY message_id
         ''', (media_group_id,))
     results = cursor.fetchall()
@@ -428,7 +438,7 @@ def cleanup_old_media_group_photos(max_age_hours: int = 24):
     else:
         cursor.execute('''
             SELECT DISTINCT media_group_id FROM media_group_photos
-            WHERE created_at < NOW() - INTERVAL '%s hours'
+            WHERE created_at < NOW() - make_interval(hours => %s)
         ''', (max_age_hours,))
     old_groups = cursor.fetchall()
     conn.close()
@@ -615,7 +625,7 @@ def cleanup_old_sale_receipt_ocr(max_age_hours: int = 48):
     else:
         cursor.execute('''
             DELETE FROM sale_receipt_ocr
-            WHERE created_at < NOW() - INTERVAL '%s hours'
+            WHERE created_at < NOW() - make_interval(hours => %s)
         ''', (max_age_hours,))
     deleted = cursor.rowcount
     conn.commit()
@@ -640,6 +650,18 @@ def normalize_bank_name(bank_name):
 def banks_match(bank_name1, bank_name2):
     """Check if two bank names match (case-insensitive, space-insensitive)"""
     return normalize_bank_name(bank_name1) == normalize_bank_name(bank_name2)
+
+def find_staff_usdt_bank(balances, user_prefix):
+    """Find staff's USDT bank for P2P sells: Binance account preferred,
+    otherwise any USDT bank with the staff's prefix"""
+    fallback = None
+    for bank in balances['usdt_banks']:
+        if bank.get('prefix') == user_prefix:
+            if 'binance' in bank.get('bank', '').lower():
+                return bank
+            if fallback is None:
+                fallback = bank
+    return fallback
 
 def get_user_prefix(user_id):
     """Get prefix name for a user"""
@@ -1088,7 +1110,7 @@ CRITICAL NOTES:
 3. Match the bank name EXACTLY as shown in the available banks list
 4. Wave, Wave M, and Wave Channel are THREE DIFFERENT accounts"""
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1097,7 +1119,8 @@ CRITICAL NOTES:
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                 ]
             }],
-            max_tokens=300
+            max_tokens=300,
+            response_format={"type": "json_object"}
         )
         
         result = response.choices[0].message.content.strip()
@@ -1230,7 +1253,7 @@ CRITICAL RULES:
 - Always return amounts as positive numbers
 - bank_type must be "binance", "swift", or "wallet" (lowercase)"""
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1239,7 +1262,8 @@ CRITICAL RULES:
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                 ]
             }],
-            max_tokens=300
+            max_tokens=300,
+            response_format={"type": "json_object"}
         )
         
         result = response.choices[0].message.content.strip()
@@ -1409,7 +1433,7 @@ CRITICAL:
 - Always return amounts as positive numbers
 - bank_type must be "binance", "swift", or "wallet" (lowercase)"""
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1418,7 +1442,8 @@ CRITICAL:
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                 ]
             }],
-            max_tokens=300
+            max_tokens=300,
+            response_format={"type": "json_object"}
         )
         
         result = response.choices[0].message.content.strip()
@@ -1554,7 +1579,7 @@ IMPORTANT:
 - DO NOT use trailing commas
 - ONLY ONE bank should have high confidence (the matching one)"""
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1563,7 +1588,8 @@ IMPORTANT:
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                 ]
             }],
-            max_tokens=400
+            max_tokens=400,
+            response_format={"type": "json_object"}
         )
         
         result = response.choices[0].message.content.strip()
@@ -1596,13 +1622,22 @@ IMPORTANT:
         # Ensure amount is positive
         data['amount'] = abs(float(data.get('amount', 0)))
         
-        # Ensure all banks have confidence scores
-        banks_confidence = data.get('banks', {})
+        # Normalize confidence scores: digit-string keys, numeric values only
+        raw_confidence = data.get('banks', {}) or {}
+        banks_confidence = {}
+        for key, value in raw_confidence.items():
+            key = str(key).strip()
+            if not key.isdigit():
+                continue
+            try:
+                banks_confidence[key] = float(value or 0)
+            except (TypeError, ValueError):
+                banks_confidence[key] = 0
         for bank in mmk_banks_list:
             bank_id = str(bank['bank_id'])
             if bank_id not in banks_confidence:
                 banks_confidence[bank_id] = 0
-        
+
         data['banks'] = banks_confidence
         
         # Log results
@@ -1707,7 +1742,7 @@ IMPORTANT:
 - ONLY ONE bank should have high confidence (the matching one)
 - For 0x addresses with low fee (~$0.5), match to BNB not ETH"""
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1716,7 +1751,8 @@ IMPORTANT:
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                 ]
             }],
-            max_tokens=400
+            max_tokens=400,
+            response_format={"type": "json_object"}
         )
         
         result = response.choices[0].message.content.strip()
@@ -1745,13 +1781,22 @@ IMPORTANT:
         # Ensure amount is positive
         data['amount'] = abs(float(data.get('amount', 0)))
         
-        # Ensure all banks have confidence scores
-        banks_confidence = data.get('banks', {})
+        # Normalize confidence scores: digit-string keys, numeric values only
+        raw_confidence = data.get('banks', {}) or {}
+        banks_confidence = {}
+        for key, value in raw_confidence.items():
+            key = str(key).strip()
+            if not key.isdigit():
+                continue
+            try:
+                banks_confidence[key] = float(value or 0)
+            except (TypeError, ValueError):
+                banks_confidence[key] = 0
         for bank in usdt_banks_list:
             bank_id = str(bank['bank_id'])
             if bank_id not in banks_confidence:
                 banks_confidence[bank_id] = 0
-        
+
         data['banks'] = banks_confidence
         
         # Log results
@@ -1925,15 +1970,20 @@ def extract_transaction_info(text):
                 'bank_breakdown': bank_breakdown if bank_breakdown else None
             }
     
-    # Regular Buy/Sell format
-    tx_type = 'buy' if 'Buy' in text else ('sell' if 'Sell' in text else None)
-    
-    usdt_match = re.search(r'(Buy|Sell)\s+([\d.]+)', text)
-    usdt_amount = float(usdt_match.group(2)) if usdt_match else None
-    
+    # Regular Buy/Sell format (case-insensitive so "buy"/"SELL" from customers also work)
+    if re.search(r'\bbuy\b', text, re.IGNORECASE):
+        tx_type = 'buy'
+    elif re.search(r'\bsell\b', text, re.IGNORECASE):
+        tx_type = 'sell'
+    else:
+        tx_type = None
+
+    usdt_match = re.search(r'\b(buy|sell)\s+([\d,]+(?:\.\d+)?)', text, re.IGNORECASE)
+    usdt_amount = float(usdt_match.group(2).replace(',', '')) if usdt_match else None
+
     mmk_match = re.search(r'=\s*([\d,]+\.?\d*)', text)
     mmk_amount = float(mmk_match.group(1).replace(',', '')) if mmk_match else None
-    
+
     return {'type': tx_type, 'usdt': usdt_amount, 'mmk': mmk_amount}
 
 async def process_buy_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, tx_info: dict):
@@ -2292,7 +2342,7 @@ Extract:
 Return JSON:
 {{"amount": <integer>, "bank_number": <1-{len(mmk_banks)}>}}"""
 
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{
                     "role": "user",
@@ -2301,7 +2351,8 @@ Return JSON:
                         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_base64}}
                     ]
                 }],
-                max_tokens=300
+                max_tokens=300,
+                response_format={"type": "json_object"}
             )
             
             result = response.choices[0].message.content.strip()
@@ -2571,7 +2622,35 @@ async def process_sell_transaction(update: Update, context: ContextTypes.DEFAULT
     original_message_id = original_message.message_id if original_message else message.message_id
     media_group_id = original_message.media_group_id if original_message else None
     media_group_id_to_cleanup = None
-    
+
+    # Parse staff reply for fee (format: fee-3039) and bank specification
+    # (format: From San(Kpay P)) BEFORE any OCR so both code paths can use them
+    staff_reply_text = message.text or message.caption or ""
+    mmk_fee = 0
+    specified_bank = None
+
+    fee_match = re.search(r'fee\s*-\s*([\d,]+(?:\.\d+)?)', staff_reply_text, re.IGNORECASE)
+    if fee_match:
+        mmk_fee = float(fee_match.group(1).replace(',', ''))
+        logger.info(f"Detected MMK fee in staff reply: {mmk_fee:,.0f} MMK")
+
+    bank_match = re.search(r'From\s+([^(]+)\(([^)]+)\)', staff_reply_text, re.IGNORECASE)
+    if bank_match:
+        prefix = bank_match.group(1).strip()
+        bank_name = bank_match.group(2).strip()
+        specified_bank_name = f"{prefix}({bank_name})"
+
+        # Find the matching bank in balances
+        for bank in balances['mmk_banks']:
+            if banks_match(bank['bank_name'], specified_bank_name):
+                specified_bank = bank
+                logger.info(f"Staff specified bank: {specified_bank_name} -> matched {bank['bank_name']}")
+                break
+
+        if not specified_bank:
+            await send_alert(message, f"❌ Specified bank '{specified_bank_name}' not found in registered MMK banks", context)
+            return
+
     # ============================================================================
     # CHECK FOR PRE-SCANNED OCR DATA
     # ============================================================================
@@ -2711,44 +2790,18 @@ async def process_sell_transaction(update: Update, context: ContextTypes.DEFAULT
                 
                 logger.info(f"MMK receipt {idx}: {receipt_mmk:,.0f} MMK from {user_result['bank']['bank_name'] if user_result['bank'] else 'unknown'} (confidence: {user_result.get('confidence', 0)}%)")
     
+    # Staff-specified bank overrides whatever OCR detected
+    if specified_bank:
+        detected_bank = specified_bank
+
     if receipt_count == 0 or not detected_bank:
         await send_alert(message, "❌ Cannot read receipt", context)
         if media_group_id_to_cleanup:
             delete_media_group_photos(media_group_id_to_cleanup)
         return
-    
+
     logger.info(f"Total MMK from {receipt_count} receipt(s): {total_detected_mmk:,.0f} MMK")
-    
-    # Check if staff reply contains fee (format: fee-3039) and bank specification (format: From San(Kpay P))
-    staff_reply_text = message.text or message.caption or ""
-    mmk_fee = 0
-    specified_bank = None
-    
-    fee_match = re.search(r'fee\s*-\s*([\d,]+(?:\.\d+)?)', staff_reply_text, re.IGNORECASE)
-    if fee_match:
-        mmk_fee = float(fee_match.group(1).replace(',', ''))
-        logger.info(f"Detected MMK fee in staff reply: {mmk_fee:,.0f} MMK")
-    
-    # Check for bank specification in format: From San(Kpay P)
-    bank_match = re.search(r'From\s+([^(]+)\(([^)]+)\)', staff_reply_text, re.IGNORECASE)
-    if bank_match:
-        prefix = bank_match.group(1).strip()
-        bank_name = bank_match.group(2).strip()
-        specified_bank_name = f"{prefix}({bank_name})"
-        
-        # Find the matching bank in balances
-        for bank in balances['mmk_banks']:
-            if banks_match(bank['bank_name'], specified_bank_name):
-                specified_bank = bank
-                logger.info(f"Staff specified bank: {specified_bank_name} -> matched {bank['bank_name']}")
-                break
-        
-        if not specified_bank:
-            await send_alert(message, f"❌ Specified bank '{specified_bank_name}' not found in registered MMK banks", context)
-            if media_group_id_to_cleanup:
-                delete_media_group_photos(media_group_id_to_cleanup)
-            return
-    
+
     # Add fee to detected MMK amount
     total_mmk = total_detected_mmk + mmk_fee
     
@@ -2790,39 +2843,41 @@ async def process_sell_transaction(update: Update, context: ContextTypes.DEFAULT
     logger.info(f"Detected USDT: {detected_usdt:.4f} (amount: {usdt_result['amount']:.4f} + fee: {usdt_result['network_fee']:.4f}) from {bank_type}")
     
     # ============================================================================
-    # UPDATE BALANCES
+    # UPDATE BALANCES (validate USDT first so a failed check leaves balances untouched)
     # ============================================================================
+    bank_type_capitalized = bank_type.capitalize()
+    expected_bank_name = f"{user_prefix}({bank_type_capitalized})"
+
+    logger.info(f"Looking for USDT bank: {expected_bank_name}")
+
+    usdt_bank_obj = None
+    for bank in balances['usdt_banks']:
+        if banks_match(bank['bank_name'], expected_bank_name):
+            usdt_bank_obj = bank
+            break
+
+    if usdt_bank_obj and usdt_bank_obj['amount'] < detected_usdt:
+        await send_alert(message,
+            f"❌ Insufficient USDT balance!\n\n"
+            f"{usdt_bank_obj['bank_name']}: {usdt_bank_obj['amount']:.4f} USDT\n"
+            f"Required: {detected_usdt:.4f} USDT",
+            context)
+        if media_group_id_to_cleanup:
+            delete_media_group_photos(media_group_id_to_cleanup)
+        return
+
     # Add MMK to detected bank
     for bank in balances['mmk_banks']:
         if banks_match(bank['bank_name'], detected_bank['bank_name']):
             bank['amount'] += total_mmk
             logger.info(f"Added {total_mmk:,.0f} MMK to {bank['bank_name']}")
             break
-    
+
     # Reduce USDT from staff's account
-    usdt_updated = False
-    bank_type_capitalized = bank_type.capitalize()
-    expected_bank_name = f"{user_prefix}({bank_type_capitalized})"
-    
-    logger.info(f"Looking for USDT bank: {expected_bank_name}")
-    
-    for bank in balances['usdt_banks']:
-        if banks_match(bank['bank_name'], expected_bank_name):
-            if bank['amount'] < detected_usdt:
-                await send_alert(message, 
-                    f"❌ Insufficient USDT balance!\n\n"
-                    f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                    f"Required: {detected_usdt:.4f} USDT", 
-                    context)
-                if media_group_id_to_cleanup:
-                    delete_media_group_photos(media_group_id_to_cleanup)
-                return
-            bank['amount'] -= detected_usdt
-            usdt_updated = True
-            logger.info(f"Reduced {detected_usdt:.4f} USDT from {bank['bank_name']}")
-            break
-    
-    if not usdt_updated:
+    if usdt_bank_obj:
+        usdt_bank_obj['amount'] -= detected_usdt
+        logger.info(f"Reduced {detected_usdt:.4f} USDT from {usdt_bank_obj['bank_name']}")
+    else:
         await send_alert(message, f"⚠️ USDT bank '{expected_bank_name}' not found", context)
     
     # Send new balance
@@ -3119,7 +3174,7 @@ async def process_internal_transfer_with_photos(update: Update, context: Context
 Return JSON: {"amount": <number>}
 Note: Return the amount as a positive number, ignore any minus signs."""
 
-                    response = client.chat.completions.create(
+                    response = await client.chat.completions.create(
                         model="gpt-4o",
                         messages=[{
                             "role": "user",
@@ -3128,7 +3183,8 @@ Note: Return the amount as a positive number, ignore any minus signs."""
                                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + photo_base64}}
                             ]
                         }],
-                        max_tokens=200
+                        max_tokens=200,
+                        response_format={"type": "json_object"}
                     )
                     
                     result = response.choices[0].message.content.strip()
@@ -3148,7 +3204,7 @@ Note: Return the amount as a positive number, ignore any minus signs."""
 Return JSON: {"amount": <number>}
 Note: Return the amount as a positive number, ignore any minus signs."""
 
-                response = client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model="gpt-4o",
                     messages=[{
                         "role": "user",
@@ -3157,7 +3213,8 @@ Note: Return the amount as a positive number, ignore any minus signs."""
                             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + photo_base64}}
                         ]
                     }],
-                    max_tokens=200
+                    max_tokens=200,
+                    response_format={"type": "json_object"}
                 )
                 
                 result = response.choices[0].message.content.strip()
@@ -3794,14 +3851,41 @@ async def process_sell_transaction_bulk(update: Update, context: ContextTypes.DE
         # First, get MMK info from original message
         original_message_id = original_message.message_id
         media_group_id_to_cleanup = None
-        
+
+        # Parse staff reply for fee (format: fee-3039) and bank specification
+        # (format: From San(Kpay P)) BEFORE any OCR so both code paths can use them
+        staff_text = message.text or message.caption or ""
+        mmk_fee = 0
+        specified_bank = None
+
+        fee_match = re.search(r'fee\s*-\s*([\d,]+(?:\.\d+)?)', staff_text, re.IGNORECASE)
+        if fee_match:
+            mmk_fee = float(fee_match.group(1).replace(',', ''))
+            logger.info(f"Detected MMK fee in staff reply: {mmk_fee:,.0f} MMK")
+
+        bank_match = re.search(r'From\s+([^(]+)\(([^)]+)\)', staff_text, re.IGNORECASE)
+        if bank_match:
+            prefix = bank_match.group(1).strip()
+            bank_name = bank_match.group(2).strip()
+            specified_bank_name = f"{prefix}({bank_name})"
+
+            # Find the matching bank in balances
+            for bank in balances['mmk_banks']:
+                if banks_match(bank['bank_name'], specified_bank_name):
+                    specified_bank = bank
+                    logger.info(f"Staff specified bank: {specified_bank_name} -> matched {bank['bank_name']}")
+                    break
+
+            if not specified_bank:
+                await send_alert(message, f"❌ Specified bank '{specified_bank_name}' not found in registered MMK banks", context)
+                return
+
         # Check if we have stored OCR data for the original message
         stored_ocr_data = get_sale_receipt_ocr(original_message_id)
-        
+
         total_detected_mmk = 0
         detected_bank = None
         mmk_receipt_count = 0
-        mmk_fee = 0
         
         if stored_ocr_data:
             # Use stored OCR data
@@ -3880,8 +3964,9 @@ async def process_sell_transaction_bulk(update: Update, context: ContextTypes.DE
                     else:
                         user_base64 = base64.b64encode(data).decode('utf-8')
                     
-                    mmk_result = await ocr_detect_mmk_bank_and_amount(user_base64, balances['mmk_banks'], user_prefix)
-                    
+                    # Customer receipts: match against ALL registered MMK banks
+                    mmk_result = await ocr_detect_mmk_bank_multi(user_base64, balances['mmk_banks'])
+
                     if mmk_result and mmk_result['amount']:
                         total_detected_mmk += mmk_result['amount']
                         mmk_receipt_count += 1
@@ -3889,40 +3974,17 @@ async def process_sell_transaction_bulk(update: Update, context: ContextTypes.DE
                             detected_bank = mmk_result['bank']
         
         
-        total_mmk = total_detected_mmk + mmk_fee
-        
+        # Staff-specified bank overrides whatever OCR detected
+        if specified_bank:
+            detected_bank = specified_bank
+
         if mmk_receipt_count == 0 or not detected_bank:
             await send_alert(message, "❌ Could not detect MMK bank/amount from sale receipt(s)", context)
             if media_group_id_to_cleanup:
                 delete_media_group_photos(media_group_id_to_cleanup)
             return
-        
-        # Check for MMK fee in staff reply and bank specification
-        staff_text = message.text or message.caption or ""
-        fee_match = re.search(r'fee\s*-\s*([\d,]+(?:\.\d+)?)', staff_text, re.IGNORECASE)
-        if fee_match:
-            mmk_fee = float(fee_match.group(1).replace(',', ''))
-        
-        # Check for bank specification in format: From San(Kpay P)
-        specified_bank = None
-        bank_match = re.search(r'From\s+([^(]+)\(([^)]+)\)', staff_text, re.IGNORECASE)
-        if bank_match:
-            prefix = bank_match.group(1).strip()
-            bank_name = bank_match.group(2).strip()
-            specified_bank_name = f"{prefix}({bank_name})"
-            
-            # Find the matching bank in balances
-            for bank in balances['mmk_banks']:
-                if banks_match(bank['bank_name'], specified_bank_name):
-                    specified_bank = bank
-                    logger.info(f"Staff specified bank: {specified_bank_name} -> matched {bank['bank_name']}")
-                    break
-            
-            if not specified_bank:
-                await send_alert(message, f"❌ Specified bank '{specified_bank_name}' not found in registered MMK banks", context)
-                if media_group_id_to_cleanup:
-                    delete_media_group_photos(media_group_id_to_cleanup)
-                return
+
+        total_mmk = total_detected_mmk + mmk_fee
         
         # Now process USDT receipts (the photos in current message)
         total_detected_usdt = 0
@@ -3959,35 +4021,38 @@ async def process_sell_transaction_bulk(update: Update, context: ContextTypes.DE
         if not detected_bank_type:
             detected_bank_type = 'swift'
         
+        # Update balances (validate USDT first so a failed check leaves balances untouched)
+        bank_type_capitalized = detected_bank_type.capitalize()
+        expected_bank_name = f"{user_prefix}({bank_type_capitalized})"
+
+        usdt_bank_obj = None
+        for bank in balances['usdt_banks']:
+            if banks_match(bank['bank_name'], expected_bank_name):
+                usdt_bank_obj = bank
+                break
+
+        if usdt_bank_obj and usdt_bank_obj['amount'] < total_detected_usdt:
+            await send_alert(message,
+                f"❌ Insufficient USDT balance!\n\n"
+                f"{usdt_bank_obj['bank_name']}: {usdt_bank_obj['amount']:.4f} USDT\n"
+                f"Required: {total_detected_usdt:.4f} USDT",
+                context)
+            if media_group_id_to_cleanup:
+                delete_media_group_photos(media_group_id_to_cleanup)
+            return
+
         # Update MMK balance
         for bank in balances['mmk_banks']:
             if banks_match(bank['bank_name'], detected_bank['bank_name']):
                 bank['amount'] += total_mmk
                 logger.info(f"Added {total_mmk:,.0f} MMK to {bank['bank_name']}")
                 break
-        
+
         # Update USDT balance
-        usdt_updated = False
-        bank_type_capitalized = detected_bank_type.capitalize()
-        expected_bank_name = f"{user_prefix}({bank_type_capitalized})"
-        
-        for bank in balances['usdt_banks']:
-            if banks_match(bank['bank_name'], expected_bank_name):
-                if bank['amount'] < total_detected_usdt:
-                    await send_alert(message, 
-                        f"❌ Insufficient USDT balance!\n\n"
-                        f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                        f"Required: {total_detected_usdt:.4f} USDT", 
-                        context)
-                    if media_group_id_to_cleanup:
-                        delete_media_group_photos(media_group_id_to_cleanup)
-                    return
-                bank['amount'] -= total_detected_usdt
-                usdt_updated = True
-                logger.info(f"Reduced {total_detected_usdt:.4f} USDT from {bank['bank_name']}")
-                break
-        
-        if not usdt_updated:
+        if usdt_bank_obj:
+            usdt_bank_obj['amount'] -= total_detected_usdt
+            logger.info(f"Reduced {total_detected_usdt:.4f} USDT from {usdt_bank_obj['bank_name']}")
+        else:
             await send_alert(message, f"⚠️ USDT bank '{expected_bank_name}' not found", context)
         
         # Send new balance
@@ -4051,30 +4116,30 @@ async def process_p2p_sell_with_breakdown(update: Update, context: ContextTypes.
     if not bank_breakdown:
         await send_alert(message, "❌ No bank breakdown found in message", context)
         return
-    
-    # Add MMK to specified banks
-    banks_updated = []
+
+    # Resolve ALL banks first (validate before mutating so a missing bank
+    # can't leave balances half-updated)
+    resolved_breakdown = []
     total_mmk = 0
-    
+
     for breakdown in bank_breakdown:
         amount = breakdown['amount']
         bank_name = breakdown['bank_name']
         total_mmk += amount
-        
+
         # Find matching bank in balances
-        bank_found = False
+        bank_obj = None
         for bank in balances['mmk_banks']:
             if banks_match(bank['bank_name'], bank_name):
-                bank['amount'] += amount
-                banks_updated.append((bank['bank_name'], amount))
-                logger.info(f"P2P Sell (breakdown): Added {amount:,.0f} MMK to {bank['bank_name']}")
-                bank_found = True
+                bank_obj = bank
                 break
-        
-        if not bank_found:
+
+        if not bank_obj:
             await send_alert(message, f"❌ Bank not found: {bank_name}", context)
             return
-    
+
+        resolved_breakdown.append((bank_obj, amount))
+
     # Verify total MMK matches message
     if abs(total_mmk - tx_info['mmk']) > 1000:
         await send_status_message(
@@ -4087,50 +4152,34 @@ async def process_p2p_sell_with_breakdown(update: Update, context: ContextTypes.
             f"<b>Difference:</b> {abs(total_mmk - tx_info['mmk']):,.0f} MMK",
             parse_mode='HTML'
         )
-    
-    # Reduce USDT from staff's Binance account (USDT + fee)
+
+    # Resolve staff's USDT account (Binance preferred) and validate balance
     total_usdt = tx_info['total_usdt']
-    usdt_updated = False
-    usdt_bank_name = None
-    
-    # First, try to find staff's Binance account specifically
-    for bank in balances['usdt_banks']:
-        if bank.get('prefix') == user_prefix and 'binance' in bank.get('bank', '').lower():
-            if bank['amount'] < total_usdt:
-                await send_alert(message,
-                    f"❌ Insufficient USDT balance!\n\n"
-                    f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                    f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                    f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                    context)
-                return
-            bank['amount'] -= total_usdt
-            usdt_updated = True
-            usdt_bank_name = bank['bank_name']
-            logger.info(f"P2P Sell (breakdown): Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (Binance)")
-            break
-    
-    # Fallback: if no Binance account found for staff, use any USDT bank with matching prefix
-    if not usdt_updated:
-        for bank in balances['usdt_banks']:
-            if bank.get('prefix') == user_prefix:
-                if bank['amount'] < total_usdt:
-                    await send_alert(message,
-                        f"❌ Insufficient USDT balance!\n\n"
-                        f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                        f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                        f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                        context)
-                    return
-                bank['amount'] -= total_usdt
-                usdt_updated = True
-                usdt_bank_name = bank['bank_name']
-                logger.info(f"P2P Sell (breakdown): Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (fallback)")
-                break
-    
-    if not usdt_updated:
+    usdt_bank_obj = find_staff_usdt_bank(balances, user_prefix)
+
+    if not usdt_bank_obj:
         await send_alert(message, f"❌ No USDT bank found for prefix '{user_prefix}'. For P2P sell, Binance account is preferred.", context)
         return
+
+    if usdt_bank_obj['amount'] < total_usdt:
+        await send_alert(message,
+            f"❌ Insufficient USDT balance!\n\n"
+            f"{usdt_bank_obj['bank_name']}: {usdt_bank_obj['amount']:.4f} USDT\n"
+            f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
+            f"Shortage: {total_usdt - usdt_bank_obj['amount']:.4f} USDT",
+            context)
+        return
+
+    # All validations passed - apply the updates
+    banks_updated = []
+    for bank_obj, amount in resolved_breakdown:
+        bank_obj['amount'] += amount
+        banks_updated.append((bank_obj['bank_name'], amount))
+        logger.info(f"P2P Sell (breakdown): Added {amount:,.0f} MMK to {bank_obj['bank_name']}")
+
+    usdt_bank_obj['amount'] -= total_usdt
+    usdt_bank_name = usdt_bank_obj['bank_name']
+    logger.info(f"P2P Sell (breakdown): Reduced {total_usdt:.4f} USDT from {usdt_bank_name}")
     
     # Send new balance
     new_balance = format_balance_message(balances['mmk_banks'], balances['usdt_banks'], balances.get('thb_banks', []))
@@ -4199,39 +4248,43 @@ async def process_staff_p2p_sell(update: Update, context: ContextTypes.DEFAULT_T
     mmk_amount = tx_info['mmk']
     usdt_amount = tx_info['usdt']
     
-    # Find and update destination MMK bank (add MMK)
-    mmk_updated = False
+    # Resolve both banks first (validate before mutating so a failed check
+    # can't leave balances half-updated)
+    dest_bank_obj = None
     for bank in balances['mmk_banks']:
         if banks_match(bank['bank_name'], dest_bank_name):
-            bank['amount'] += mmk_amount
-            mmk_updated = True
-            logger.info(f"Staff P2P Sell: Added {mmk_amount:,.0f} MMK to {bank['bank_name']}")
+            dest_bank_obj = bank
             break
-    
-    if not mmk_updated:
+
+    if not dest_bank_obj:
         await send_alert(message, f"❌ Destination MMK bank '{dest_bank_name}' not found", context)
         return
-    
-    # Find and update source USDT bank (subtract USDT)
-    usdt_updated = False
+
+    src_bank_obj = None
     for bank in balances['usdt_banks']:
         if banks_match(bank['bank_name'], src_bank_name):
-            if bank['amount'] < usdt_amount:
-                await send_alert(message, 
-                    f"❌ Insufficient USDT in {bank['bank_name']}: "
-                    f"Available: {bank['amount']:.4f} USDT, "
-                    f"Required: {usdt_amount:.4f} USDT, "
-                    f"Shortage: {usdt_amount - bank['amount']:.4f} USDT",
-                    context)
-                return
-            bank['amount'] -= usdt_amount
-            usdt_updated = True
-            logger.info(f"Staff P2P Sell: Reduced {usdt_amount:.4f} USDT from {bank['bank_name']}")
+            src_bank_obj = bank
             break
-    
-    if not usdt_updated:
+
+    if not src_bank_obj:
         await send_alert(message, f"❌ Source USDT bank '{src_bank_name}' not found", context)
         return
+
+    if src_bank_obj['amount'] < usdt_amount:
+        await send_alert(message,
+            f"❌ Insufficient USDT in {src_bank_obj['bank_name']}: "
+            f"Available: {src_bank_obj['amount']:.4f} USDT, "
+            f"Required: {usdt_amount:.4f} USDT, "
+            f"Shortage: {usdt_amount - src_bank_obj['amount']:.4f} USDT",
+            context)
+        return
+
+    # All validations passed - apply the updates
+    dest_bank_obj['amount'] += mmk_amount
+    logger.info(f"Staff P2P Sell: Added {mmk_amount:,.0f} MMK to {dest_bank_obj['bank_name']}")
+
+    src_bank_obj['amount'] -= usdt_amount
+    logger.info(f"Staff P2P Sell: Reduced {usdt_amount:.4f} USDT from {src_bank_obj['bank_name']}")
     
     # Send new balance
     new_balance = format_balance_message(balances['mmk_banks'], balances['usdt_banks'], balances.get('thb_banks', []))
@@ -4344,6 +4397,24 @@ async def process_p2p_sell_with_photos(update: Update, context: ContextTypes.DEF
         )
         logger.warning(f"MMK amount mismatch! Expected: {tx_info['mmk']:,.0f} MMK, Detected: {total_detected_mmk:,.0f} MMK - Processing with detected amount")
     
+    # Reduce USDT from staff's Binance account (USDT + fee) - validate BEFORE
+    # adding MMK so a failed check leaves balances untouched
+    total_usdt = tx_info['total_usdt']  # This includes the fee
+    usdt_bank_obj = find_staff_usdt_bank(balances, user_prefix)
+
+    if not usdt_bank_obj:
+        await send_alert(message, f"❌ No USDT bank found for prefix '{user_prefix}'. For P2P sell, Binance account is preferred.", context)
+        return
+
+    if usdt_bank_obj['amount'] < total_usdt:
+        await send_alert(message,
+            f"❌ Insufficient USDT balance!\n\n"
+            f"{usdt_bank_obj['bank_name']}: {usdt_bank_obj['amount']:.4f} USDT\n"
+            f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
+            f"Shortage: {total_usdt - usdt_bank_obj['amount']:.4f} USDT",
+            context)
+        return
+
     # Add MMK to detected bank(s) - supports multiple banks
     banks_updated = []
     for detected_bank, receipt_amount in detected_banks:
@@ -4353,53 +4424,10 @@ async def process_p2p_sell_with_photos(update: Update, context: ContextTypes.DEF
                 banks_updated.append((bank['bank_name'], receipt_amount))
                 logger.info(f"Added {receipt_amount:,.0f} MMK to {bank['bank_name']}")
                 break
-    
-    # Reduce USDT from staff's Binance account (USDT + fee)
-    # For P2P sell, always use Binance as the USDT bank
-    total_usdt = tx_info['total_usdt']  # This includes the fee
-    usdt_updated = False
-    usdt_bank_name = None
-    
-    # First, try to find staff's Binance account specifically
-    for bank in balances['usdt_banks']:
-        if bank.get('prefix') == user_prefix and 'binance' in bank.get('bank', '').lower():
-            # Check if sufficient USDT balance
-            if bank['amount'] < total_usdt:
-                await send_alert(message,
-                    f"❌ Insufficient USDT balance!\n\n"
-                    f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                    f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                    f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                    context)
-                return
-            bank['amount'] -= total_usdt
-            usdt_updated = True
-            usdt_bank_name = bank['bank_name']
-            logger.info(f"P2P Sell (Media Group): Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (Binance) (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
-            break
-    
-    # Fallback: if no Binance account found for staff, use any USDT bank with matching prefix
-    if not usdt_updated:
-        for bank in balances['usdt_banks']:
-            if bank.get('prefix') == user_prefix:
-                # Check if sufficient USDT balance
-                if bank['amount'] < total_usdt:
-                    await send_alert(message,
-                        f"❌ Insufficient USDT balance!\n\n"
-                        f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                        f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                        f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                        context)
-                    return
-                bank['amount'] -= total_usdt
-                usdt_updated = True
-                usdt_bank_name = bank['bank_name']
-                logger.info(f"P2P Sell (Media Group): Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (fallback) (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
-                break
-    
-    if not usdt_updated:
-        await send_alert(message, f"❌ No USDT bank found for prefix '{user_prefix}'. For P2P sell, Binance account is preferred.", context)
-        return
+
+    usdt_bank_obj['amount'] -= total_usdt
+    usdt_bank_name = usdt_bank_obj['bank_name']
+    logger.info(f"P2P Sell (Media Group): Reduced {total_usdt:.4f} USDT from {usdt_bank_name} (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
     
     # Send new balance
     new_balance = format_balance_message(balances['mmk_banks'], balances['usdt_banks'], balances.get('thb_banks', []))
@@ -4555,6 +4583,24 @@ async def process_p2p_sell_transaction(update: Update, context: ContextTypes.DEF
         )
         logger.warning(f"MMK amount mismatch! Expected: {tx_info['mmk']:,.0f} MMK, Detected: {total_detected_mmk:,.0f} MMK - Processing with detected amount")
     
+    # Reduce USDT from staff's Binance account (USDT + fee) - validate BEFORE
+    # adding MMK so a failed check leaves balances untouched
+    total_usdt = tx_info['total_usdt']  # This includes the fee
+    usdt_bank_obj = find_staff_usdt_bank(balances, user_prefix)
+
+    if not usdt_bank_obj:
+        await send_alert(message, f"❌ No USDT bank found for prefix '{user_prefix}'. For P2P sell, Binance account is preferred.", context)
+        return
+
+    if usdt_bank_obj['amount'] < total_usdt:
+        await send_alert(message,
+            f"❌ Insufficient USDT balance!\n\n"
+            f"{usdt_bank_obj['bank_name']}: {usdt_bank_obj['amount']:.4f} USDT\n"
+            f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
+            f"Shortage: {total_usdt - usdt_bank_obj['amount']:.4f} USDT",
+            context)
+        return
+
     # Add MMK to detected bank(s) - supports multiple banks
     banks_updated = []
     for detected_bank, receipt_amount in detected_banks:
@@ -4564,53 +4610,10 @@ async def process_p2p_sell_transaction(update: Update, context: ContextTypes.DEF
                 banks_updated.append((bank['bank_name'], receipt_amount))
                 logger.info(f"Added {receipt_amount:,.0f} MMK to {bank['bank_name']}")
                 break
-    
-    # Reduce USDT from staff's Binance account (USDT + fee)
-    # For P2P sell, always use Binance as the USDT bank
-    total_usdt = tx_info['total_usdt']  # This includes the fee
-    usdt_updated = False
-    usdt_bank_name = None
-    
-    # First, try to find staff's Binance account specifically
-    for bank in balances['usdt_banks']:
-        if bank.get('prefix') == user_prefix and 'binance' in bank.get('bank', '').lower():
-            # Check if sufficient USDT balance
-            if bank['amount'] < total_usdt:
-                await send_alert(message,
-                    f"❌ Insufficient USDT balance!\n\n"
-                    f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                    f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                    f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                    context)
-                return
-            bank['amount'] -= total_usdt
-            usdt_updated = True
-            usdt_bank_name = bank['bank_name']
-            logger.info(f"P2P Sell: Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (Binance) (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
-            break
-    
-    # Fallback: if no Binance account found for staff, use any USDT bank with matching prefix
-    if not usdt_updated:
-        for bank in balances['usdt_banks']:
-            if bank.get('prefix') == user_prefix:
-                # Check if sufficient USDT balance
-                if bank['amount'] < total_usdt:
-                    await send_alert(message,
-                        f"❌ Insufficient USDT balance!\n\n"
-                        f"{bank['bank_name']}: {bank['amount']:.4f} USDT\n"
-                        f"Required: {total_usdt:.4f} USDT (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})\n"
-                        f"Shortage: {total_usdt - bank['amount']:.4f} USDT",
-                        context)
-                    return
-                bank['amount'] -= total_usdt
-                usdt_updated = True
-                usdt_bank_name = bank['bank_name']
-                logger.info(f"P2P Sell: Reduced {total_usdt:.4f} USDT from {bank['bank_name']} (fallback) (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
-                break
-    
-    if not usdt_updated:
-        await send_alert(message, f"❌ No USDT bank found for prefix '{user_prefix}'. For P2P sell, Binance account is preferred.", context)
-        return
+
+    usdt_bank_obj['amount'] -= total_usdt
+    usdt_bank_name = usdt_bank_obj['bank_name']
+    logger.info(f"P2P Sell: Reduced {total_usdt:.4f} USDT from {usdt_bank_name} (USDT: {tx_info['usdt']:.4f} + Fee: {tx_info['fee']:.4f})")
     
     # Send new balance
     new_balance = format_balance_message(balances['mmk_banks'], balances['usdt_banks'], balances.get('thb_banks', []))
@@ -4686,8 +4689,8 @@ async def process_sale_receipt_immediate(update: Update, context: ContextTypes.D
     message_id = message.message_id
     media_group_id = message.media_group_id
     transaction_type = tx_info.get('type')
-    expected_mmk = tx_info.get('mmk', 0)
-    expected_usdt = tx_info.get('usdt', 0)
+    expected_mmk = tx_info.get('mmk') or 0
+    expected_usdt = tx_info.get('usdt') or 0
     
     logger.info(f"🔍 Immediate OCR processing for sale message {message_id} (type: {transaction_type})")
     
@@ -4872,8 +4875,8 @@ async def process_sale_media_group_immediate(update: Update, context: ContextTyp
         return
     
     transaction_type = tx_info.get('type')
-    expected_mmk = tx_info.get('mmk', 0)
-    expected_usdt = tx_info.get('usdt', 0)
+    expected_mmk = tx_info.get('mmk') or 0
+    expected_usdt = tx_info.get('usdt') or 0
     
     logger.info(f"🔍 Immediate OCR processing for media group {media_group_id} with {len(stored_photos)} photos")
     
@@ -5035,7 +5038,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Log ALL messages received in target group (for debugging)
     if message.chat.id == TARGET_GROUP_ID:
         msg_type = "text" if message.text else ("photo" if message.photo else "other")
-        logger.info(f"🔍 Received {msg_type} message - Chat: {message.chat.id}, Thread: {message.message_thread_id}, User: {message.from_user.id} (@{message.from_user.username})")
+        user_desc = f"{message.from_user.id} (@{message.from_user.username})" if message.from_user else "unknown (no from_user)"
+        logger.info(f"🔍 Received {msg_type} message - Chat: {message.chat.id}, Thread: {message.message_thread_id}, User: {user_desc}")
     
     if message.chat.id != TARGET_GROUP_ID:
         return
@@ -5049,7 +5053,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 thb_count = len(balances.get('thb_banks', []))
                 logger.info(f"✅ Balance loaded: {len(balances['mmk_banks'])} MMK banks, {len(balances['usdt_banks'])} USDT banks, {thb_count} THB banks")
         return
-    
+
+    # Transaction flows need a real sender (anonymous admins / channel posts have no from_user)
+    if not message.from_user:
+        logger.info("   ⏭️ Skipping: message has no from_user (anonymous/channel post)")
+        return
+
     # Handle internal transfers in Accounts Matter topic
     if ACCOUNTS_MATTER_TOPIC_ID and message.message_thread_id == ACCOUNTS_MATTER_TOPIC_ID:
         # Check if this is an additional photo in an existing internal transfer media group
@@ -6301,10 +6310,34 @@ async def remove_usdt_bank_command(update: Update, context: ContextTypes.DEFAULT
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors gracefully"""
     logger.error(f"Exception while handling an update: {context.error}")
-    
+
     # Log the error but don't crash - network errors are transient
-    import traceback
     logger.error("".join(traceback.format_exception(None, context.error, context.error.__traceback__)))
+
+async def _periodic_cleanup(application):
+    """Hourly cleanup of old media-group photos and stale OCR records"""
+    while True:
+        try:
+            cleanup_old_media_group_photos(max_age_hours=24)
+            cleanup_old_sale_receipt_ocr(max_age_hours=48)
+        except Exception as e:
+            logger.error(f"Periodic cleanup failed: {e}")
+            logger.error(traceback.format_exc())
+        await asyncio.sleep(3600)
+
+async def _post_init(application):
+    """Start background tasks once the application is initialized"""
+    application.create_task(_periodic_cleanup(application))
+
+async def set_user_dispatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_user works two ways:
+    - reply to a user's message: /set_user <prefix_name>
+    - direct: /set_user <user_id> <prefix_name>
+    """
+    if update.message and update.message.reply_to_message:
+        await set_user_reply_command(update, context)
+    else:
+        await set_user_command(update, context)
 
 def main():
     """Start bot"""
@@ -6331,6 +6364,7 @@ def main():
         .get_updates_read_timeout(60.0)     # Timeout for getUpdates read
         .get_updates_write_timeout(60.0)    # Timeout for getUpdates write
         .get_updates_pool_timeout(60.0)     # Timeout for getUpdates pool
+        .post_init(_post_init)              # Start periodic cleanup task
         .build()
     )
     
@@ -6340,7 +6374,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("load", load_command))
-    app.add_handler(CommandHandler("set_user", set_user_reply_command))
+    app.add_handler(CommandHandler("set_user", set_user_dispatch_command))
     app.add_handler(CommandHandler("list_users", list_users_command))
     app.add_handler(CommandHandler("remove_user", remove_user_command))
     app.add_handler(CommandHandler("set_receiving_usdt_acc", set_receiving_usdt_acc_command))
