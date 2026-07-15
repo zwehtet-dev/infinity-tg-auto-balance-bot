@@ -103,6 +103,15 @@ def _post_init_factory(settings: Settings):
 
 
 def main() -> None:
+    # python-telegram-bot 21.x calls asyncio.get_event_loop() during
+    # run_polling and relies on it auto-creating a loop when none exists.
+    # That behaviour was removed in Python 3.12+ (a hard RuntimeError on
+    # 3.14). Ensure a loop exists in the main thread before PTB looks for it.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     try:
         settings = Settings.load()
     except ConfigError as e:
