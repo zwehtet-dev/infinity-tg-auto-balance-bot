@@ -34,6 +34,14 @@ cp .env.example .env
 python bot.py
 ```
 
+## Deploy On Ubuntu VPS
+
+Use the Ubuntu deployment guide in [DEPLOY_UBUNTU_VPS.md](DEPLOY_UBUNTU_VPS.md).
+
+Included helper files:
+
+- `deploy/infinity-balance-bot.service` - `systemd` unit for running the bot as a service
+
 ## Balance Message Format
 
 New format with staff prefixes:
