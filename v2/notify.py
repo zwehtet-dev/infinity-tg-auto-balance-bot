@@ -4,10 +4,11 @@ Centralizes three things v1 scattered across every handler:
 
 - routing (alert topic vs. reply vs. main chat),
 - **HTML escaping** of user-controlled values (usernames, bank names, free
-  text). v1 interpolated these raw into ``parse_mode='HTML'`` messages — a
-  markup-injection bug that could break or spoof bot output,
-- retry-once on transient Telegram send errors, and a log-only fallback so a
-  failed notification never crashes transaction processing.
+    text). v1 interpolated these raw into ``parse_mode='HTML'`` messages — a
+    markup-injection bug that could break or spoof bot output,
+- retries with backoff on transient Telegram network send errors, and a
+    log-only fallback so a failed notification never crashes transaction
+    processing.
 """
 
 from __future__ import annotations
@@ -18,11 +19,13 @@ import logging
 from typing import Optional
 
 from telegram import Bot, Message
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
 from config import Settings
 
 logger = logging.getLogger(__name__)
+
+_SEND_ATTEMPTS = 3
 
 
 def esc(value: object) -> str:
@@ -42,7 +45,7 @@ class Notifier:
         parse_mode: Optional[str],
         reply_to: Optional[Message] = None,
     ) -> None:
-        for attempt in (1, 2):
+        for attempt in range(1, _SEND_ATTEMPTS + 1):
             try:
                 if reply_to is not None:
                     await reply_to.reply_text(text, parse_mode=parse_mode)
@@ -54,11 +57,26 @@ class Notifier:
                         parse_mode=parse_mode,
                     )
                 return
+            except RetryAfter as e:
+                logger.warning("Send rate-limited (attempt %d/%d): %s", attempt, _SEND_ATTEMPTS, e)
+                if attempt < _SEND_ATTEMPTS:
+                    await asyncio.sleep(e.retry_after + 0.5)
+            except (TimedOut, NetworkError) as e:
+                logger.warning(
+                    "Transient Telegram send failure (attempt %d/%d): %s",
+                    attempt,
+                    _SEND_ATTEMPTS,
+                    e,
+                )
+                if attempt < _SEND_ATTEMPTS:
+                    await asyncio.sleep(float(attempt))
             except TelegramError as e:
-                logger.warning("Send failed (attempt %d): %s", attempt, e)
-                if attempt == 1:
-                    await asyncio.sleep(1.0)
+                logger.warning("Telegram send failed without retry: %s", e)
+                break
         logger.error("Dropped outgoing message after retries: %.120s", text)
+
+    async def reply(self, message: Message, text: str, parse_mode: Optional[str] = "HTML") -> None:
+        await self._send(text, None, parse_mode, reply_to=message)
 
     async def alert(self, text: str, reply_to: Optional[Message] = None) -> None:
         """Error/warning. Goes to the alert topic when configured, else as a

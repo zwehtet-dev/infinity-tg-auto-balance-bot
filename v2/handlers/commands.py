@@ -137,7 +137,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if message.chat.id == settings.target_group_id
         else f"❌ Wrong group (expected {settings.target_group_id})"
     )
-    await message.reply_text(text, parse_mode="HTML")
+    await svc.notifier.reply(message, text, parse_mode="HTML")
 
 
 # ------------------------------------------------------------------- balance

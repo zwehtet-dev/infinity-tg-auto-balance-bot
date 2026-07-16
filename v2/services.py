@@ -8,12 +8,14 @@ independently testable.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from telegram import Bot, PhotoSize, User
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 from balances import BalanceLedger
@@ -36,6 +38,7 @@ from repositories import (
 logger = logging.getLogger(__name__)
 
 SERVICES_KEY = "services"
+_DOWNLOAD_ATTEMPTS = 3
 
 
 @dataclass
@@ -79,15 +82,45 @@ class Services:
 
     # ------------------------------------------------------------- helpers
 
+    async def _download_photo(self, bot: Bot, photo: PhotoSize) -> bytes:
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            try:
+                photo_file = await bot.get_file(photo.file_id)
+                return bytes(await photo_file.download_as_bytearray())
+            except RetryAfter as e:
+                logger.warning(
+                    "Photo download rate-limited for %s (attempt %d/%d): %s",
+                    photo.file_id,
+                    attempt,
+                    _DOWNLOAD_ATTEMPTS,
+                    e,
+                )
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    await asyncio.sleep(e.retry_after + 0.5)
+                    continue
+                raise
+            except (TimedOut, NetworkError) as e:
+                logger.warning(
+                    "Transient Telegram photo download failure for %s (attempt %d/%d): %s",
+                    photo.file_id,
+                    attempt,
+                    _DOWNLOAD_ATTEMPTS,
+                    e,
+                )
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    await asyncio.sleep(float(attempt))
+                    continue
+                raise
+            except TelegramError:
+                raise
+
     async def download_photo_b64(self, bot: Bot, photo: PhotoSize) -> str:
         """Download a Telegram photo and return it base64-encoded for OCR."""
-        photo_file = await bot.get_file(photo.file_id)
-        photo_bytes = await photo_file.download_as_bytearray()
+        photo_bytes = await self._download_photo(bot, photo)
         return base64.b64encode(bytes(photo_bytes)).decode("utf-8")
 
     async def download_photo_bytes(self, bot: Bot, photo: PhotoSize) -> bytes:
-        photo_file = await bot.get_file(photo.file_id)
-        return bytes(await photo_file.download_as_bytearray())
+        return await self._download_photo(bot, photo)
 
     @staticmethod
     def read_file_b64(file_path: str) -> str:
