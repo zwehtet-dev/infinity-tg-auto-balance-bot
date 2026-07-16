@@ -38,6 +38,7 @@ DEFAULT_MMK_BANKS = [
     ("San(Yoma)", "007011118014339", "Daw Chaw Su Thu Zar"),
     ("San(Kpay P)", "300948464", "Chaw Su"),
     ("San(AYA)", "40038204256", "CHAW SU THU ZAR"),
+    ("San(Kpay P)", "09420093777", "San Wint Htal"),
 ]
 DEFAULT_USDT_WALLETS = [
     ("ACT(BNB Wallet)", "0x640e9AEde10B610834876cCc0ef2576C9469CB0e", "BNB"),
